@@ -1,0 +1,5 @@
+use S00233718finalSummer24
+go
+create proc AlterPlanetEcoSystemIDX
+as
+ALTER INDEX NonClusteredIndexPlanetID ON dbo.PlanetEcosystemTBL REBUILD
