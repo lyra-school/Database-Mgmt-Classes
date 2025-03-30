@@ -1,0 +1,595 @@
+-- L: comments prepended with L are mine, to signify what I've
+-- refactored vs the original code
+
+-- L: new sproc for updating a denormalized patient count column
+create proc [dbo].[UpdateWardPatientCount]
+@EWardID int, @EIncrement tinyint, @EOriginalTimestamp timestamp
+, @OUpdatedRows int output
+as
+
+begin try
+	update dbo.WarDTBL
+	set CurrentCount = ISNULL(CurrentCount, 0) + @EIncrement
+	where WardID = @EWardID and RowVers = @EOriginalTimestamp
+
+	-- L: this must be done in this sproc and not the master
+	-- I know from experience that system procedures can behave oddly when called from
+	-- a different sproc than the one whose data needs to be captured
+	select @OUpdatedRows = @@ROWCOUNT
+end try
+begin catch
+	;throw
+end catch
+go;
+
+-- L: I ran this code through a SQL formatter on poorsql.com because the original is
+-- really hard to read due to lack of whitespace, sorry
+ALTER PROC [dbo].[ExamMasterV1]
+	-- external variables
+	@EFname VARCHAR(35)
+	,@ELname VARCHAR(35)
+	,@EDOB DATE
+	,@EWardID INT
+	,@ECareteamID INT
+	,@ECovidStatus VARCHAR(20)
+AS
+-- L: set the isolation level within the sproc
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+
+-- L: explicitly start a transaction
+BEGIN TRANSACTION
+
+-- internal variables
+DECLARE @IWardcapacity TINYINT
+	,@IWardspec VARCHAR(25)
+	-- L: changed name to reflect the new table structure
+	,@IWardCurrentCount TINYINT
+	,@INoofDoctors TINYINT
+	,@INoOfNurses TINYINT
+	,@INoOfSpecNurses TINYINT
+	,@IDay VARCHAR(12)
+	,@IAge TINYINT
+	,@IPatientID INT
+	,@ICareTeamFlag BIT = 1
+	,@IName VARCHAR(100)
+	,@msgtext VARCHAR(1000)
+	,@msg VARCHAR(1000)
+	,@IAddNurseN INT
+	,@IAddNurseP INT
+	,@IWardRowTimestamp TIMESTAMP
+	,@IRowsUpdated INT
+	,@INurseWasSelected BIT = 0
+
+-- L: these are used for retry loops
+DECLARE @IRetryCount INT = 0, @IRetryCount2 INT = 0, @IRetryCount3 INT = 0, @IRetryCount4 INT = 0
+SET NOCOUNT ON
+
+-- L: using a savepoint for sake of rollbacks within retries (I don't know when
+-- "general" rollbacks terminate the entire sproc instead of parts of a transaction)
+SAVE TRANSACTION BeforeReads
+
+-- L: retry block - this could be more efficient but due to usage of row versioning and
+-- the fact that the assignment requires *absolute* 2-phase locking protocol, retrying
+-- patient inserts means that reads must be redone
+-- IF the 2-phase locking protocol didn't have to be followed exactly, it would be enough
+-- to re-read the WardTBL and perform ward capacity checks; however, that's not the case here
+WHILE(@IRetryCount < 3)
+BEGIN
+-- do the reads
+--read the data from the ward table
+SELECT @IWardcapacity = WardCapacity
+	,@IWardspec = WardSpeciality
+	,@IWardCurrentCount = CurrentCount
+	,@IWardRowTimestamp = RowVers
+FROM dbo.WardTbl
+WHERE WardID = @EWardID
+
+-- how many nurses are there on this care team
+SELECT @INoOfNurses = COUNT(*)
+FROM dbo.NurseCareTeamMembersTBL
+WHERE CareTeamID = @ECareteamID
+	AND CurrentMember = 1
+
+-- how many nurses are there on this care team who have the speciality
+SELECT @INoOfSpecNurses = count(*)
+FROM dbo.NurseCareTeamMembersTBL AS nc
+JOIN dbo.NurseTBL AS n ON nc.MemberID = n.NurseID
+WHERE CareTeamID = @ECareteamID
+	AND SUBSTRING(NurseSpeciality, (len(NurseSpeciality) - 2), 3) LIKE SUBSTRING(@IWardspec, 1, 3)
+	AND CurrentMember = 1
+
+-- how many doctors are there on this care team 
+--who have the speciality
+SELECT @INoofDoctors = COUNT(*)
+FROM dbo.DoctorTbl AS d
+INNER JOIN dbo.DoctorCareTeamMembersTBL AS dc ON d.DoctorID = dc.MemberID
+WHERE CareTeamID = @ECareteamID
+	AND SUBSTRING(DoctorSpeciality, (len(DoctorSpeciality) - 2), 3) LIKE SUBSTRING(@IWardspec, 1, 3)
+	AND CurrentMember = 1
+
+-- what day of the week is it
+SELECT @IDay = DATENAME(dw, getdate())
+
+--now populate the temp tables with available nurses from the ward
+-- who are not active on 3 care teams
+SELECT NurseID
+INTO #t1
+FROM dbo.NurseTBL AS n
+JOIN dbo.NurseCareTeamMembersTBL AS c ON n.NurseID = c.MemberID
+WHERE CurrentMember = 1
+	AND NurseWard = @EWardID
+	AND NURSEID NOT IN (
+		SELECT MemberID
+		FROM DBO.NurseCareTeamMembersTBL
+		WHERE CurrentMember = @ECareteamID
+		)
+GROUP BY NurseID
+HAVING count(*) < 3
+-- add in those not assinged to a care team 
+-- and have not been assinged to a ward
+-- and have not been vaccinated
+
+UNION
+
+SELECT NurseID
+FROM dbo.NurseTBL AS n
+LEFT JOIN dbo.NurseCareTeamMembersTBL AS nc ON n.NurseID = nc.MemberID
+WHERE nc.MemberID IS NULL
+	AND NurseWard IS NULL
+	AND COVID19Vacinated = 0
+
+-- randomly select a nurse from this table
+SELECT TOP 1 @IAddNurseN = NurseID
+FROM #t1
+ORDER BY newid()
+
+-- now repeat this but this time 
+-- get nurses that have been vaccinated
+SELECT NurseID
+INTO #t2
+FROM dbo.NurseTBL AS n
+JOIN dbo.NurseCareTeamMembersTBL AS c ON n.NurseID = c.MemberID
+WHERE CurrentMember = 1
+	AND NurseWard = @EWardID
+	AND NURSEID NOT IN (
+		SELECT MemberID
+		FROM DBO.NurseCareTeamMembersTBL
+		WHERE CurrentMember = @ECareteamID
+			AND CareTeamID = 1
+		)
+GROUP BY NurseID
+HAVING count(*) < 3
+-- add in those not assinged to a care team 
+-- and have not been assinged to a ward
+-- and have  been vaccinated
+
+UNION
+
+SELECT NurseID
+FROM dbo.NurseTBL AS n
+LEFT JOIN dbo.NurseCareTeamMembersTBL AS nc ON n.NurseID = nc.MemberID
+WHERE nc.MemberID IS NULL
+	AND NurseWard IS NULL
+	AND COVID19Vacinated = 1
+
+-- now randomly select from this list
+SELECT TOP 1 @IAddNurseP = NurseID
+FROM #t2
+ORDER BY newid()
+
+-- Do The Logic
+-- get the patients age
+IF MONTH(@EDOB) <= MONTH(getdate())
+	AND day(@EDOB) <= day(getdate())
+BEGIN
+	SELECT @IAge = DATEDIFF(yy, @EDOB, getdate())
+END
+ELSE
+BEGIN
+	SELECT @iage = (DATEDIFF(yy, @EDOB, getdate())) - 1
+END
+
+--is the ward full and its not a weekend
+IF @IWardcapacity <= @IWardCurrentCount
+BEGIN
+	IF @iday NOT LIKE 'sunday'
+		AND @IDay NOT LIKE 'saturday'
+	BEGIN
+		SELECT @IName = Upper(substring(@EFname, 1, 1)) + SUBSTRING(@EFname, 2, len(@EFname)) + ' ' + Upper(substring(@ELname, 1, 1)) + SUBSTRING(@ELname, 2, len(@ELname))
+
+		-- L: changed this message to be in line with the brief
+		SELECT @msgtext = N'This ward is full – find a different ward for %s'
+
+		SELECT @msg = FORMATMESSAGE(@msgtext, @IName);
+		
+		-- L: full rollback here - we can expect the capacity rule to fail no matter
+		-- the retry
+		ROLLBACK TRANSACTION
+
+		;THROW 50001
+			,@msg
+			,1
+	END
+	ELSE
+	--is the ward at 120% capacity and it is a weekend
+	IF ceiling((@IWardcapacity * 1.2)) <= @IWardCurrentCount
+	BEGIN
+		SELECT @IName = Upper(substring(@EFname, 1, 1)) + SUBSTRING(@EFname, 2, len(@EFname)) + ' ' + Upper(substring(@ELname, 1, 1)) + SUBSTRING(@ELname, 2, len(@ELname))
+
+		SELECT @msgtext = N'This ward is overflowing – find a different ward for %s'
+
+		SELECT @msg = FORMATMESSAGE(@msgtext, @IName);
+		
+		-- L: full rollback here - we can expect the capacity rule to fail no matter
+		-- the retry
+		ROLLBACK TRANSACTION
+
+		;THROW 50001
+			,@msg
+			,1
+	END
+END
+
+-- what about the age rules
+SELECT @msgtext = CASE 
+		-- less that or equal to 13
+		WHEN @IAge <= 13
+			AND (
+				@Iwardspec NOT LIKE '%Paeds13%'
+				AND @IWardspec NOT LIKE '%Paediatrics13%'
+				)
+			THEN N'Patients in this ward must be 13 or younger'
+				--age > 13 and M 15 ==> 14 years old check
+		WHEN @IAge = 14
+			AND (
+				@Iwardspec NOT LIKE '%Paeds15%'
+				AND @IWardspec NOT LIKE '%Paediatrics15%'
+				)
+			THEN N'Patients in this ward must be 14'
+				--aged between 15 and 18 check
+		WHEN @IAge BETWEEN 15
+				AND 18
+			AND (
+				@IWardspec NOT LIKE '%paeds%'
+				OR (
+					@Iwardspec LIKE '%paeds13%'
+					OR @IWardspec LIKE '%paeds15%'
+					OR @Iwardspec LIKE '%paediatrics13%'
+					OR @IWardspec LIKE '%paediatrics15%'
+					)
+				)
+			THEN N'Patients between 15 and 18 not allowed in this ward'
+		WHEN @IAge > 18
+			AND (
+				@IWardspec LIKE '%paeds%'
+				OR (
+					@Iwardspec LIKE '%paeds13%'
+					OR @IWardspec LIKE '%paeds15%'
+					OR @Iwardspec LIKE '%paediatrics13%'
+					OR @IWardspec LIKE '%paediatrics15%'
+					)
+				)
+			THEN N'Adults are not allowed on Children''s ward'
+		ELSE NULL
+		END
+
+--if one of the ages causes a fail finish here
+IF @msgtext IS NOT NULL
+BEGIN
+	SELECT @msg = FORMATMESSAGE(@msgtext);
+	
+	-- L: full rollback here - this rule will keep failing if we try to retry
+	ROLLBACK TRANSACTION
+	
+	-- L: is it intended for this and the above two THROWs to use the same error code?
+	;THROW 50001
+		,@msg
+		,1
+END
+
+-- L: I don't know if the following needs to be refactored to be more in line with the
+-- original brief? I believe that speciality checks are intended to be done only after
+-- adding the nurse; additionally, this seems to lead into adding a nurse no matter what,
+-- when it should do so only if there's 1 nurse in the care team
+
+-- I'm assuming that the logic should be left as it is here and I should focus on the concurrency
+
+--Now Do Care Team Rules
+--is there a nurse with the speciality
+IF @INoOfSpecNurses = 0
+BEGIN
+	SELECT @ICareTeamFlag = 0
+
+	RAISERROR (
+			'no nurse has the required speciality'
+			,16
+			,1
+			)
+END
+
+-- is there a doctor with the speciality
+IF @INoofDoctors = 0
+BEGIN
+	SELECT @ICareTeamFlag = 0
+
+	RAISERROR (
+			'no doctor has the required speciality'
+			,16
+			,1
+			)
+END
+
+--enough current members for Covid Positive?
+IF (
+		@INoOfNurses < 2
+		OR @INoofDoctors < 1
+		)
+	-- L: fixed a typo here - if this is checking for COVID positive/unknown statuses, it should be
+	-- NOT LIKE 'Negative' instead of NOT LIKE 'Positive' as it originally was
+	AND @ECovidStatus NOT LIKE 'Negative'
+	AND @IAddNurseP IS NULL
+BEGIN
+	SELECT @ICareTeamFlag = 0
+
+	RAISERROR (
+			'not enough members available for the team'
+			,16
+			,1
+			)
+END
+
+-- enough current members for Covid Negative?
+IF (
+		@INoOfNurses < 2
+		OR @INoofDoctors < 1
+		)
+	AND @ECovidStatus LIKE 'Negative'
+	AND @IAddNursen IS NULL
+BEGIN
+	SELECT @ICareTeamFlag = 0
+
+	RAISERROR (
+			'not enough members available for the team'
+			,16
+			,1
+			)
+END
+
+--OK Business Rules have been passed
+--Call other procs to do the inserts
+--insert the patient
+BEGIN TRY
+	EXEC dbo.InsertPatient @eFname
+		,@ELname
+		,@EWardID
+		,@ECovidStatus
+		,@OPatientID = @IPatientID OUTPUT
+END TRY
+
+BEGIN CATCH
+	-- L: according to Microsoft docs, XACT_STATE should be checked after errors
+	-- before rolling back to a savepoint - if it's in a faulty state, there's no point
+	-- as the entire transaction can't be committed anyway, even if it's a deadlock
+	IF(ERROR_NUMBER() = 1205 AND XACT_STATE() <> -1)
+	BEGIN
+		SET @IRetryCount = @IRetryCount + 1
+		ROLLBACK TRANSACTION BeforeReads
+		CONTINUE
+	END
+	ELSE
+	BEGIN
+		-- L: if something else is the error and the transaction is in a faulty state,
+		-- assume that retrying would result in the same so do a full rollback
+		ROLLBACK TRANSACTION
+		;THROW
+	END
+	
+END CATCH
+
+-- L: this is where the patient count check is achieved, and the WardTBL col updated
+-- it shares the same retry number as above as it's closely related to patient inserts
+BEGIN TRY
+	EXEC dbo.UpdateWardPatientCount
+		 @EWardID
+		, 1
+		, @IWardRowTimestamp
+		, @IRowsUpdated OUTPUT
+END TRY
+BEGIN CATCH
+	-- L: according to Microsoft docs, XACT_STATE should be checked after errors
+	-- before rolling back to a savepoint - if it's in a faulty state, there's no point
+	-- as the entire transaction can't be committed anyway, even if it's a deadlock
+	IF(ERROR_NUMBER() = 1205 AND XACT_STATE() <> -1)
+	BEGIN
+		SET @IRetryCount = @IRetryCount + 1
+		ROLLBACK TRANSACTION BeforeReads
+		CONTINUE
+	END
+	ELSE
+	BEGIN
+		-- L: if something else is the error and the transaction is in a faulty state,
+		-- assume that retrying would result in the same so do a full rollback
+		ROLLBACK TRANSACTION
+		;THROW
+	END
+	
+END CATCH
+
+-- L: if updated rows is 0 from the above sproc execution, this means that there's a
+-- mismatch between row versions (another transaction updated WardTBL since the beginning)
+-- so retry
+IF(@IRowsUpdated = 0)
+BEGIN
+	SET @IRetryCount = @IRetryCount + 1
+	ROLLBACK TRANSACTION BeforeReads
+	CONTINUE
+END
+
+-- L: we are done with the patient inserts, which happens whether the care team stuff
+-- suceeds or not
+SAVE TRANSACTION AfterPatientInsert
+
+-- add the nurse to the care team if there is one available
+-- L: added a check here - according to the original brief/Q&A, unvaccinated nurses can't be
+-- selected for a COVID-positive patient
+IF @IAddNurseN IS NOT NULL AND @ECovidStatus LIKE 'Negative'
+BEGIN
+	WHILE(@IRetryCount2 < 3)
+	BEGIN
+	BEGIN TRY
+		-- L: the following two exec sproc statements might be typos?
+		-- the original brief says that this one should be named dbo.InsertNurse, not
+		-- dbo.AddNurseToCareTeam, but I don't know if this should be corrected or not
+		EXEC dbo.AddNurseToCareTeam @ECareTeamID
+			,@IAddNurseN
+		SET @INurseWasSelected = 1
+	END TRY
+
+	BEGIN CATCH
+	-- L: according to Microsoft docs, XACT_STATE should be checked after errors
+	-- before rolling back to a savepoint - if it's in a faulty state, there's no point
+	-- as the entire transaction can't be committed anyway, even if it's a deadlock
+	IF(ERROR_NUMBER() = 1205 AND XACT_STATE() <> -1)
+	BEGIN
+		SET @IRetryCount2 = @IRetryCount2 + 1
+		CONTINUE
+	END
+	ELSE IF(XACT_STATE() <> -1)
+	BEGIN
+		-- L: the patient must be inserted regardless of the error with the nurse
+		COMMIT TRANSACTION
+		;THROW 50003, 'Patient has not been assigned to the care team but has been admitted to the ward', 1
+	END
+	ELSE
+	BEGIN
+		-- L: if transaction is faulty, rollback
+		ROLLBACK TRANSACTION
+		;THROW
+	END
+	END CATCH
+	END
+
+	IF(@IRetryCount2 = 3)
+	BEGIN
+		-- L: same as above goes if retrying fails
+		COMMIT TRANSACTION
+		;THROW 50003, 'Patient has not been assigned to the care team but has been admitted to the ward', 1
+	END
+END
+
+-- L: only one nurse can be added, so check that they weren't added in the previous operation
+IF @IAddNurseP IS NOT NULL AND @INurseWasSelected = 0
+BEGIN
+	WHILE(@IRetryCount3 < 3)
+	BEGIN
+	BEGIN TRY
+		-- L: the following two exec sproc statements might be typos?
+		-- the original brief says that this one should be named dbo.InsertNurse, not
+		-- dbo.AddNurseToCareTeam, but I don't know if this should be corrected or not
+		EXEC dbo.AddNurseToCareTeam @ECareTeamID
+			,@IAddNurseP
+	END TRY
+
+	BEGIN CATCH
+	-- L: according to Microsoft docs, XACT_STATE should be checked after errors
+	-- before rolling back to a savepoint - if it's in a faulty state, there's no point
+	-- as the entire transaction can't be committed anyway, even if it's a deadlock
+	IF(ERROR_NUMBER() = 1205 AND XACT_STATE() <> -1)
+	BEGIN
+		SET @IRetryCount3 = @IRetryCount3 + 1
+		CONTINUE
+	END
+	ELSE IF(XACT_STATE() <> -1)
+	BEGIN
+		-- L: the patient must be inserted regardless of the error with the nurse
+		COMMIT TRANSACTION
+		;THROW 50003, 'Patient has not been assigned to the care team but has been admitted to the ward', 1
+	END
+	ELSE
+	BEGIN
+		-- L: if transaction is faulty, rollback
+		ROLLBACK TRANSACTION
+		;THROW
+	END
+	END CATCH
+	END
+
+	IF(@IRetryCount3 = 3)
+	BEGIN
+		-- L: same as above goes if retrying fails
+		COMMIT TRANSACTION
+		;THROW 50003, 'Patient has not been assigned to the care team but has been admitted to the ward', 1
+	END
+END
+
+-- Assign the Patient to the Care Team if allowed 
+IF @ICareTeamFlag = 1
+BEGIN
+	WHILE(@IRetryCount4 < 3)
+	BEGIN
+	BEGIN TRY
+	EXEC dbo.InsertToCareTeam @eCareteamID
+		,@IPatientID
+	END TRY
+
+	BEGIN CATCH
+	-- L: according to Microsoft docs, XACT_STATE should be checked after errors
+	-- before rolling back to a savepoint - if it's in a faulty state, there's no point
+	-- as the entire transaction can't be committed anyway, even if it's a deadlock
+	IF(ERROR_NUMBER() = 1205 AND XACT_STATE() <> -1)
+	BEGIN
+		SET @IRetryCount4 = @IRetryCount4 + 1
+		CONTINUE
+	END
+	ELSE IF(XACT_STATE() <> -1)
+	BEGIN
+		-- L: the patient must be inserted regardless of the error with the nurse
+		COMMIT TRANSACTION
+		;THROW 50003, 'Patient has not been assigned to the care team but has been admitted to the ward', 1
+	END
+	ELSE
+	BEGIN
+		-- L: if transaction is faulty, rollback
+		ROLLBACK TRANSACTION
+		;THROW
+	END
+	END CATCH
+	END
+
+	IF(@IRetryCount4 = 3)
+	BEGIN
+		-- L: same as above goes if retrying fails
+		COMMIT TRANSACTION
+		;THROW 50003, 'Patient has not been assigned to the care team but has been admitted to the ward', 1
+	END
+END
+ELSE
+BEGIN
+	-- L: if the care team is invalid (I assume that's what ICareTeamFlag is supposed to signal) then this
+	-- error must be displayed according to the brief
+	COMMIT TRANSACTION
+	;THROW 50003, 'Patient has not been assigned to the care team but has been admitted to the ward', 1
+END
+
+
+--all ok do a cleanup of tem table
+DROP TABLE #t1;
+
+DROP TABLE #t2;
+
+-- got here let them know
+RAISERROR (
+		'The Patient has been admitted'
+		,16
+		,1
+		)
+
+-- L: commit when everything is okay
+COMMIT TRANSACTION
+RETURN 0
+END
+
+-- L: if this point gets reached, it means that the while loop never successfully returned or errored
+ROLLBACK TRANSACTION
+;THROW 50010, 'Due to heavy congestion, the patient insert has failed.', 1
+GO;
